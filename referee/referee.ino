@@ -13,7 +13,60 @@
 #include <SPI.h>
 #include <RF24.h>
 #include <Adafruit_NeoPixel.h>
-#include "../common/config.h"
+
+// ============================================
+// Configuration
+// ============================================
+
+// RF24 pins (nRF24L01 uses hardware SPI: SCK=D13, MOSI=D11, MISO=D12)
+#define RF_CE_PIN       8
+#define RF_CSN_PIN      10
+#define RF_CHANNEL      100
+#define RF_PA_LEVEL     RF24_PA_HIGH
+
+// Referee pins
+#define REFEREE_BUTTON_PIN  7
+#define REFEREE_BUZZER_PIN  4
+#define REFEREE_RGB_PIN     3
+#define REFEREE_NUM_LEDS    1
+
+// Timing
+#define LOCKOUT_DURATION    3000
+#define DEBOUNCE_DELAY      50
+#define RF_RETRY_DELAY      5
+#define RF_RETRY_COUNT      15
+
+// Max players
+#define MAX_PLAYERS 8
+
+// Protocol message types
+#define MSG_RESET       0x01
+#define MSG_BUZZ        0x02
+#define MSG_ACK_WINNER  0x03
+#define MSG_LOCKOUT     0x04
+
+// Pipe addresses
+const byte REFEREE_ADDR[6] = "REF01";
+const byte BROADCAST_ADDR[6] = "BCAST";
+
+// Team colors (RGB)
+const uint8_t TEAM_COLORS[][3] = {
+    {0,   255, 0},    // Player 0: Green
+    {255, 0,   0},    // Player 1: Red
+    {0,   0,   255},  // Player 2: Blue
+    {255, 255, 0},    // Player 3: Yellow
+    {255, 0,   255},  // Player 4: Magenta
+    {0,   255, 255},  // Player 5: Cyan
+    {255, 128, 0},    // Player 6: Orange
+    {255, 255, 255},  // Player 7: White
+};
+
+// Message structure
+struct BuzzerMessage {
+    uint8_t type;
+    uint8_t playerId;
+    uint8_t data;
+};
 
 // ============================================
 // RF24 Setup
@@ -29,9 +82,9 @@ Adafruit_NeoPixel rgbLed(REFEREE_NUM_LEDS, REFEREE_RGB_PIN, NEO_GRB + NEO_KHZ800
 // State Variables
 // ============================================
 enum RefereeState {
-    STATE_IDLE,         // Waiting for reset button
-    STATE_LISTENING,    // Listening for player buzzes
-    STATE_LOCKED        // Winner determined, locked out
+    STATE_IDLE,
+    STATE_LISTENING,
+    STATE_LOCKED
 };
 
 RefereeState currentState = STATE_IDLE;
@@ -47,23 +100,18 @@ void setup() {
     Serial.begin(115200);
     Serial.println(F("Referee Controller starting..."));
 
-    // Setup pins
     pinMode(REFEREE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(REFEREE_BUZZER_PIN, OUTPUT);
-
     digitalWrite(REFEREE_BUZZER_PIN, LOW);
 
-    // Initialize NeoPixel
     rgbLed.begin();
-    rgbLed.setBrightness(128);  // 50% brightness
+    rgbLed.setBrightness(128);
     rgbLed.clear();
     rgbLed.show();
 
-    // Initialize radio
     if (!radio.begin()) {
         Serial.println(F("Radio init failed!"));
         while (1) {
-            // Flash red to indicate error
             setColor(255, 0, 0);
             delay(100);
             setColor(0, 0, 0);
@@ -76,14 +124,10 @@ void setup() {
     radio.setDataRate(RF24_250KBPS);
     radio.setRetries(RF_RETRY_DELAY, RF_RETRY_COUNT);
 
-    // Open pipes
-    radio.openReadingPipe(1, REFEREE_ADDR);  // Listen for player buzzes
-
+    radio.openReadingPipe(1, REFEREE_ADDR);
     radio.startListening();
 
-    // Startup indication
     startupAnimation();
-
     Serial.println(F("Ready. Press button to start round."));
 }
 
@@ -95,13 +139,10 @@ void loop() {
 
     switch (currentState) {
         case STATE_IDLE:
-            // Waiting for referee to press reset
             break;
-
         case STATE_LISTENING:
             checkForBuzz();
             break;
-
         case STATE_LOCKED:
             checkLockoutTimeout();
             break;
@@ -120,7 +161,6 @@ void checkButton() {
 
     if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
         if (reading == LOW && lastButtonState == HIGH) {
-            // Button pressed
             broadcastReset();
         }
     }
@@ -134,38 +174,29 @@ void checkButton() {
 void broadcastReset() {
     Serial.println(F("=== ROUND START ==="));
 
-    // Reset state
     winnerId = -1;
     currentState = STATE_LISTENING;
-
-    // Clear LED
     setColor(0, 0, 0);
-
-    // Beep
     beep(100);
 
-    // Send reset broadcast
     radio.stopListening();
     radio.openWritingPipe(BROADCAST_ADDR);
 
     BuzzerMessage msg;
     msg.type = MSG_RESET;
-    msg.playerId = 0xFF;  // Broadcast indicator
+    msg.playerId = 0xFF;
     msg.data = 0;
 
-    // Send multiple times for reliability
     for (int i = 0; i < 3; i++) {
         radio.write(&msg, sizeof(msg));
         delay(5);
     }
 
-    // Resume listening for buzzes
     radio.openReadingPipe(1, REFEREE_ADDR);
     radio.startListening();
 
     Serial.println(F("Listening for buzzes..."));
 
-    // Flash white briefly to indicate ready
     setColor(255, 255, 255);
     delay(100);
     setColor(0, 0, 0);
@@ -197,20 +228,14 @@ void handleWinner(uint8_t playerId) {
     currentState = STATE_LOCKED;
     lockoutStartTime = millis();
 
-    // Show winner's color
     setColor(
         TEAM_COLORS[playerId][0],
         TEAM_COLORS[playerId][1],
         TEAM_COLORS[playerId][2]
     );
 
-    // Victory beep
     beep(200);
-
-    // Send acknowledgment to winner
     sendAckToWinner(playerId);
-
-    // Send lockout to all others
     sendLockout(playerId);
 }
 
@@ -220,7 +245,6 @@ void handleWinner(uint8_t playerId) {
 void sendAckToWinner(uint8_t playerId) {
     radio.stopListening();
 
-    // Create player-specific address
     byte playerAddr[6];
     memcpy(playerAddr, "PLY00", 6);
     playerAddr[3] = '0' + playerId;
@@ -232,7 +256,6 @@ void sendAckToWinner(uint8_t playerId) {
     msg.playerId = playerId;
     msg.data = 0;
 
-    // Send multiple times
     for (int i = 0; i < 3; i++) {
         radio.write(&msg, sizeof(msg));
         delay(5);
@@ -244,16 +267,15 @@ void sendAckToWinner(uint8_t playerId) {
 // ============================================
 // Send lockout broadcast to all players
 // ============================================
-void sendLockout(uint8_t winnerId) {
+void sendLockout(uint8_t winId) {
     radio.stopListening();
     radio.openWritingPipe(BROADCAST_ADDR);
 
     BuzzerMessage msg;
     msg.type = MSG_LOCKOUT;
-    msg.playerId = winnerId;  // Tell them who won
+    msg.playerId = winId;
     msg.data = 0;
 
-    // Send multiple times
     for (int i = 0; i < 3; i++) {
         radio.write(&msg, sizeof(msg));
         delay(5);
@@ -294,7 +316,6 @@ void beep(int duration) {
 // Startup animation
 // ============================================
 void startupAnimation() {
-    // Cycle through team colors
     for (int i = 0; i < 4; i++) {
         setColor(
             TEAM_COLORS[i][0],
