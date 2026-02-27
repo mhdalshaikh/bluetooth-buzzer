@@ -1,7 +1,6 @@
 /*
  * Bluetooth Buzzer System - Player Device
- *
- * Hardware: Arduino Nano + nRF24L01
+ * Hardware: RF-Nano (Arduino Nano + built-in nRF24L01)
  *
  * IMPORTANT: Set PLAYER_ID before uploading to each player device!
  */
@@ -12,25 +11,23 @@
 // ============================================
 // CONFIGURE THIS FOR EACH PLAYER
 // ============================================
-#define PLAYER_ID  0  // Change this: 0=Green, 1=Red, 2=Blue, etc.
+#define PLAYER_ID  1  // Change this: 0=Green, 1=Red, 2=Blue, etc.
 
 // ============================================
-// Configuration
+// Configuration for RF-Nano
 // ============================================
-
-// RF24 pins (nRF24L01 uses hardware SPI: SCK=D13, MOSI=D11, MISO=D12)
-#define RF_CE_PIN       8
-#define RF_CSN_PIN      10
+#define RF_CE_PIN       10
+#define RF_CSN_PIN      9
 #define RF_CHANNEL      100
 #define RF_PA_LEVEL     RF24_PA_HIGH
 
 // Player pins
-#define PLAYER_BUTTON_PIN   9
-#define PLAYER_BUZZER_PIN   4
-#define PLAYER_LED_PIN      7
+#define PLAYER_BUTTON_PIN   7   // Button signal
+#define PLAYER_BUZZER_PIN   4   // Buzzer
+#define PLAYER_LED_PIN      2   // Button's built-in LED
 
 // Timing
-#define DEBOUNCE_DELAY      50
+#define RESPONSE_TIMEOUT    2000   // 2 sec to wait for referee
 #define RF_RETRY_DELAY      5
 #define RF_RETRY_COUNT      15
 
@@ -56,16 +53,15 @@ struct BuzzerMessage {
 // ============================================
 RF24 radio(RF_CE_PIN, RF_CSN_PIN);
 
-// Player-specific listening address
-byte playerAddr[6];
-
 // ============================================
 // State Variables
 // ============================================
-bool canBuzz = false;
+bool canBuzz = true;
 bool isWinner = false;
+bool waitingForResponse = false;
 bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
+unsigned long lastPressTime = 0;
+unsigned long buzzSentTime = 0;
 
 // ============================================
 // Setup
@@ -76,7 +72,6 @@ void setup() {
     Serial.print(PLAYER_ID);
     Serial.println(F(" starting..."));
 
-    // Setup pins
     pinMode(PLAYER_BUTTON_PIN, INPUT_PULLUP);
     pinMode(PLAYER_BUZZER_PIN, OUTPUT);
     pinMode(PLAYER_LED_PIN, OUTPUT);
@@ -84,12 +79,11 @@ void setup() {
     digitalWrite(PLAYER_BUZZER_PIN, LOW);
     digitalWrite(PLAYER_LED_PIN, LOW);
 
-    // Create player-specific address
-    memcpy(playerAddr, "PLY00", 6);
-    playerAddr[3] = '0' + PLAYER_ID;
+    radio.begin();
+    delay(100);
 
-    // Initialize radio
-    if (!radio.begin()) {
+    radio.setChannel(RF_CHANNEL);
+    if (radio.getChannel() != RF_CHANNEL) {
         Serial.println(F("Radio init failed!"));
         while (1) {
             digitalWrite(PLAYER_LED_PIN, HIGH);
@@ -98,25 +92,21 @@ void setup() {
             delay(100);
         }
     }
+    Serial.println(F("Radio OK!"));
 
-    radio.setChannel(RF_CHANNEL);
     radio.setPALevel(RF_PA_LEVEL);
     radio.setDataRate(RF24_250KBPS);
     radio.setRetries(RF_RETRY_DELAY, RF_RETRY_COUNT);
 
-    // Open pipes
     radio.openWritingPipe(REFEREE_ADDR);
     radio.openReadingPipe(1, BROADCAST_ADDR);
-    radio.openReadingPipe(2, playerAddr);
 
     radio.startListening();
 
-    // Startup indication
     beep(100);
     blinkLED(3);
 
-    canBuzz = false;
-    Serial.println(F("Ready. Waiting for referee reset..."));
+    Serial.println(F("Ready!"));
 }
 
 // ============================================
@@ -125,6 +115,7 @@ void setup() {
 void loop() {
     checkRadio();
     checkButton();
+    checkTimeout();
 }
 
 // ============================================
@@ -156,17 +147,15 @@ void checkRadio() {
 }
 
 // ============================================
-// Check button with debounce
+// Check button
 // ============================================
 void checkButton() {
     bool reading = digitalRead(PLAYER_BUTTON_PIN);
 
-    if (reading != lastButtonState) {
-        lastDebounceTime = millis();
-    }
+    if (reading == LOW && lastButtonState == HIGH) {
+        if ((millis() - lastPressTime) > 200) {
+            lastPressTime = millis();
 
-    if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
-        if (reading == LOW && lastButtonState == HIGH) {
             if (canBuzz && !isWinner) {
                 sendBuzz();
             }
@@ -177,7 +166,20 @@ void checkButton() {
 }
 
 // ============================================
-// Send buzz message to referee
+// Check for response timeout
+// ============================================
+void checkTimeout() {
+    if (waitingForResponse && !isWinner) {
+        if ((millis() - buzzSentTime) > RESPONSE_TIMEOUT) {
+            Serial.println(F("No response - ready again"));
+            waitingForResponse = false;
+            canBuzz = true;
+        }
+    }
+}
+
+// ============================================
+// Send buzz message
 // ============================================
 void sendBuzz() {
     Serial.println(F("BUZZ!"));
@@ -195,55 +197,58 @@ void sendBuzz() {
     radio.startListening();
 
     if (success) {
-        Serial.println(F("Buzz sent!"));
+        Serial.println(F("Buzz sent - waiting..."));
+        waitingForResponse = true;
+        buzzSentTime = millis();
     } else {
-        Serial.println(F("Buzz send failed!"));
+        Serial.println(F("Send failed - try again"));
     }
 
     canBuzz = false;
 }
 
 // ============================================
-// Handle reset from referee
+// Handle reset
 // ============================================
 void handleReset() {
-    Serial.println(F("RESET received"));
+    Serial.println(F("RESET - new round!"));
 
-    canBuzz = true;
     isWinner = false;
+    waitingForResponse = false;
     digitalWrite(PLAYER_LED_PIN, LOW);
     beep(30);
+    delay(100);
+    canBuzz = true;
 }
 
 // ============================================
-// Handle winning acknowledgment
+// Handle win
 // ============================================
 void handleWin() {
     Serial.println(F("*** WINNER! ***"));
 
     isWinner = true;
     canBuzz = false;
+    waitingForResponse = false;
     digitalWrite(PLAYER_LED_PIN, HIGH);
 
-    for (int i = 0; i < 3; i++) {
-        beep(100);
-        delay(100);
-    }
+    beep(150);
 }
 
 // ============================================
-// Handle lockout (someone else won)
+// Handle lockout
 // ============================================
 void handleLockout() {
-    Serial.println(F("Locked out - another player won"));
+    Serial.println(F("Locked out"));
 
     canBuzz = false;
     isWinner = false;
+    waitingForResponse = false;
     digitalWrite(PLAYER_LED_PIN, LOW);
 }
 
 // ============================================
-// Utility: Beep the buzzer
+// Utility: Beep
 // ============================================
 void beep(int duration) {
     digitalWrite(PLAYER_BUZZER_PIN, HIGH);

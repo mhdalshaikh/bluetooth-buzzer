@@ -1,13 +1,6 @@
 /*
  * Bluetooth Buzzer System - Referee Controller
- *
- * Hardware: Arduino Nano + nRF24L01 + WS2812 RGB LED
- *
- * The referee acts as the master controller:
- * - Broadcasts RESET to enable all players
- * - Receives buzz signals and determines winner
- * - Shows winner's team color on RGB LED
- * - Auto-resets after lockout duration
+ * Hardware: RF-Nano (Arduino Nano + built-in nRF24L01)
  */
 
 #include <SPI.h>
@@ -15,24 +8,21 @@
 #include <Adafruit_NeoPixel.h>
 
 // ============================================
-// Configuration
+// Configuration for RF-Nano
 // ============================================
-
-// RF24 pins (nRF24L01 uses hardware SPI: SCK=D13, MOSI=D11, MISO=D12)
-#define RF_CE_PIN       8
-#define RF_CSN_PIN      10
+#define RF_CE_PIN       10
+#define RF_CSN_PIN      9
 #define RF_CHANNEL      100
 #define RF_PA_LEVEL     RF24_PA_HIGH
 
 // Referee pins
 #define REFEREE_BUTTON_PIN  7
-#define REFEREE_BUZZER_PIN  4
-#define REFEREE_RGB_PIN     3
+#define REFEREE_BUZZER_PIN  6
+#define REFEREE_RGB_PIN     5
 #define REFEREE_NUM_LEDS    1
 
 // Timing
-#define LOCKOUT_DURATION    3000
-#define DEBOUNCE_DELAY      50
+#define LOCKOUT_DURATION    3000  // 3 seconds before auto-reset
 #define RF_RETRY_DELAY      5
 #define RF_RETRY_COUNT      15
 
@@ -69,36 +59,31 @@ struct BuzzerMessage {
 };
 
 // ============================================
-// RF24 Setup
+// Hardware Setup
 // ============================================
 RF24 radio(RF_CE_PIN, RF_CSN_PIN);
-
-// ============================================
-// NeoPixel Setup
-// ============================================
-Adafruit_NeoPixel rgbLed(REFEREE_NUM_LEDS, REFEREE_RGB_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel rgbLed(REFEREE_NUM_LEDS, REFEREE_RGB_PIN, NEO_RGB + NEO_KHZ800);
 
 // ============================================
 // State Variables
 // ============================================
 enum RefereeState {
-    STATE_IDLE,
-    STATE_LISTENING,
+    STATE_READY,
     STATE_LOCKED
 };
 
-RefereeState currentState = STATE_IDLE;
+RefereeState currentState = STATE_READY;
 int8_t winnerId = -1;
 unsigned long lockoutStartTime = 0;
 bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
+unsigned long lastPressTime = 0;
 
 // ============================================
 // Setup
 // ============================================
 void setup() {
     Serial.begin(115200);
-    Serial.println(F("Referee Controller starting..."));
+    Serial.println(F("Referee starting..."));
 
     pinMode(REFEREE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(REFEREE_BUZZER_PIN, OUTPUT);
@@ -106,10 +91,13 @@ void setup() {
 
     rgbLed.begin();
     rgbLed.setBrightness(128);
-    rgbLed.clear();
-    rgbLed.show();
+    setColor(0, 0, 0);
 
-    if (!radio.begin()) {
+    radio.begin();
+    delay(100);
+
+    radio.setChannel(RF_CHANNEL);
+    if (radio.getChannel() != RF_CHANNEL) {
         Serial.println(F("Radio init failed!"));
         while (1) {
             setColor(255, 0, 0);
@@ -118,8 +106,8 @@ void setup() {
             delay(100);
         }
     }
+    Serial.println(F("Radio OK!"));
 
-    radio.setChannel(RF_CHANNEL);
     radio.setPALevel(RF_PA_LEVEL);
     radio.setDataRate(RF24_250KBPS);
     radio.setRetries(RF_RETRY_DELAY, RF_RETRY_COUNT);
@@ -128,7 +116,7 @@ void setup() {
     radio.startListening();
 
     startupAnimation();
-    Serial.println(F("Ready. Press button to start round."));
+    Serial.println(F("Ready!"));
 }
 
 // ============================================
@@ -138,11 +126,10 @@ void loop() {
     checkButton();
 
     switch (currentState) {
-        case STATE_IDLE:
-            break;
-        case STATE_LISTENING:
+        case STATE_READY:
             checkForBuzz();
             break;
+
         case STATE_LOCKED:
             checkLockoutTimeout();
             break;
@@ -150,17 +137,14 @@ void loop() {
 }
 
 // ============================================
-// Check referee button with debounce
+// Check referee button
 // ============================================
 void checkButton() {
     bool reading = digitalRead(REFEREE_BUTTON_PIN);
 
-    if (reading != lastButtonState) {
-        lastDebounceTime = millis();
-    }
-
-    if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
-        if (reading == LOW && lastButtonState == HIGH) {
+    if (reading == LOW && lastButtonState == HIGH) {
+        if ((millis() - lastPressTime) > 200) {
+            lastPressTime = millis();
             broadcastReset();
         }
     }
@@ -169,13 +153,13 @@ void checkButton() {
 }
 
 // ============================================
-// Broadcast reset to all players
+// Broadcast reset
 // ============================================
 void broadcastReset() {
-    Serial.println(F("=== ROUND START ==="));
+    Serial.println(F("=== NEW ROUND ==="));
 
     winnerId = -1;
-    currentState = STATE_LISTENING;
+    currentState = STATE_READY;
     setColor(0, 0, 0);
     beep(100);
 
@@ -187,23 +171,21 @@ void broadcastReset() {
     msg.playerId = 0xFF;
     msg.data = 0;
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         radio.write(&msg, sizeof(msg));
-        delay(5);
+        delay(10);
     }
+    delay(50);
 
     radio.openReadingPipe(1, REFEREE_ADDR);
     radio.startListening();
+    delay(50);
 
-    Serial.println(F("Listening for buzzes..."));
-
-    setColor(255, 255, 255);
-    delay(100);
-    setColor(0, 0, 0);
+    Serial.println(F("Listening..."));
 }
 
 // ============================================
-// Check for incoming buzz signals
+// Check for buzz
 // ============================================
 void checkForBuzz() {
     if (radio.available()) {
@@ -217,7 +199,7 @@ void checkForBuzz() {
 }
 
 // ============================================
-// Handle winner determination
+// Handle winner
 // ============================================
 void handleWinner(uint8_t playerId) {
     Serial.print(F("*** WINNER: Player "));
@@ -228,28 +210,20 @@ void handleWinner(uint8_t playerId) {
     currentState = STATE_LOCKED;
     lockoutStartTime = millis();
 
-    setColor(
-        TEAM_COLORS[playerId][0],
-        TEAM_COLORS[playerId][1],
-        TEAM_COLORS[playerId][2]
-    );
+    setColor(TEAM_COLORS[playerId][0], TEAM_COLORS[playerId][1], TEAM_COLORS[playerId][2]);
 
-    beep(200);
     sendAckToWinner(playerId);
     sendLockout(playerId);
+
+    beep(100);
 }
 
 // ============================================
-// Send ACK to winning player
+// Send ACK
 // ============================================
 void sendAckToWinner(uint8_t playerId) {
     radio.stopListening();
-
-    byte playerAddr[6];
-    memcpy(playerAddr, "PLY00", 6);
-    playerAddr[3] = '0' + playerId;
-
-    radio.openWritingPipe(playerAddr);
+    radio.openWritingPipe(BROADCAST_ADDR);
 
     BuzzerMessage msg;
     msg.type = MSG_ACK_WINNER;
@@ -258,14 +232,14 @@ void sendAckToWinner(uint8_t playerId) {
 
     for (int i = 0; i < 3; i++) {
         radio.write(&msg, sizeof(msg));
-        delay(5);
+        delay(3);
     }
 
     radio.startListening();
 }
 
 // ============================================
-// Send lockout broadcast to all players
+// Send lockout
 // ============================================
 void sendLockout(uint8_t winId) {
     radio.stopListening();
@@ -278,7 +252,7 @@ void sendLockout(uint8_t winId) {
 
     for (int i = 0; i < 3; i++) {
         radio.write(&msg, sizeof(msg));
-        delay(5);
+        delay(3);
     }
 
     radio.openReadingPipe(1, REFEREE_ADDR);
@@ -286,17 +260,17 @@ void sendLockout(uint8_t winId) {
 }
 
 // ============================================
-// Check for lockout timeout (auto-reset)
+// Check lockout timeout
 // ============================================
 void checkLockoutTimeout() {
     if ((millis() - lockoutStartTime) >= LOCKOUT_DURATION) {
-        Serial.println(F("Auto-reset after timeout"));
+        Serial.println(F("Auto-reset"));
         broadcastReset();
     }
 }
 
 // ============================================
-// Utility: Set RGB LED color
+// Utility: Set RGB color
 // ============================================
 void setColor(uint8_t r, uint8_t g, uint8_t b) {
     rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
@@ -304,7 +278,7 @@ void setColor(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // ============================================
-// Utility: Beep the buzzer
+// Utility: Beep
 // ============================================
 void beep(int duration) {
     digitalWrite(REFEREE_BUZZER_PIN, HIGH);
@@ -317,12 +291,8 @@ void beep(int duration) {
 // ============================================
 void startupAnimation() {
     for (int i = 0; i < 4; i++) {
-        setColor(
-            TEAM_COLORS[i][0],
-            TEAM_COLORS[i][1],
-            TEAM_COLORS[i][2]
-        );
-        delay(200);
+        setColor(TEAM_COLORS[i][0], TEAM_COLORS[i][1], TEAM_COLORS[i][2]);
+        delay(150);
     }
     setColor(0, 0, 0);
     beep(100);
